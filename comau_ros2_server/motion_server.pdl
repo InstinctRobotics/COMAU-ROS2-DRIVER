@@ -21,9 +21,10 @@ CONST
   -- means the ROS driver is gone or stalled: the queued motion is cancelled and the socket is restarted.
   -- The driver streams a step every 10 ms (100 Hz); the longest gap it produces on purpose is 500 ms
   -- (kMaxStepInterval with fly_min_step on), 200 ms with stream_decimation 20. 1000 ms = 2x the longest gap.
-  -- (0 = heartbeat off). The same timeout is also what makes a silent socket visible at all: without it the
-  -- READ in receive_motion_message waits for ever.
-  KI_HEARTBEAT_MS = 1000
+  -- (0 = heartbeat off). DEFAULT OFF: with 0 the code never touches $DV_TOUT. Set it to 1000 only after the
+  -- test on the real controller described in docs/disconnect-safety.md (scope of $DV_TOUT, error code of the
+  -- read timeout). 1000 ms = 2x the longest gap the driver produces on purpose.
+  KI_HEARTBEAT_MS = 0
   -- Error values
   KI_ERR_NULL               = 0x00000 -- Null error
   KI_ERR_STATE_ACCEPT       = 0x00001 -- State  Server  error 15470 : Address already in use
@@ -343,19 +344,27 @@ VAR
   t_joint_pos   : JOINTPOS FOR ARM[1]
   t_position    : POSITION 
   vs_err_string : STRING[50]
+  t_hb_armed    : BOOLEAN
+  t_dv_tout     : INTEGER
 BEGIN
   $ERROR := 0
+  t_hb_armed := FALSE
   -- Heartbeat: only while MOVEFLY steps are being streamed the wait for the next message has a timeout
   -- (a read timeout is trapped below as error 39992). Otherwise it waits forever, as before.
   -- KI_HEARTBEAT_MS = 0 switches the heartbeat off.
+  -- $DV_TOUT is touched only when the heartbeat is on: its previous value is saved and restored.
   IF vb_fly_streaming AND (KI_HEARTBEAT_MS > 0) THEN
-    $DV_TOUT := KI_HEARTBEAT_MS
+    t_hb_armed := TRUE
+    t_dv_tout  := $DV_TOUT
+    $DV_TOUT   := KI_HEARTBEAT_MS
   ENDIF
   ERR_TRAP_ON(39990, 39991, 39992)
   READ vi_server_netlun (t_msg.id::4, t_msg.vs_motion_type::1)
   ERR_TRAP_OFF(39990, 39991, 39992)
-  $DV_TOUT := 0   -- the rest of the message is read without timeout, as before
-  IF vb_fly_streaming AND ($ERROR = 39992) THEN
+  IF t_hb_armed THEN
+    $DV_TOUT := t_dv_tout   -- restore the previous value (not forced to 0)
+  ENDIF
+  IF t_hb_armed AND ($ERROR = 39992) THEN
     -- Nothing received for KI_HEARTBEAT_MS during the stream
     vb_fly_streaming := FALSE
     IF ($CRNT_DATA[KI_ARM_NUM].MOVE_STATE > 0) THEN

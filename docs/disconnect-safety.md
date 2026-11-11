@@ -1,5 +1,9 @@
 # Sicurezza alla disconnessione: annullamento del movimento in coda
 
+**Stato di default: annullamento alla disconnessione ATTIVO (C++ e PDL), heartbeat SPENTO** (`KI_HEARTBEAT_MS = 0`).
+Con il heartbeat spento il PDL non tocca mai `$DV_TOUT` e `receive_motion_message` segue lo stesso percorso di
+prima (l'unica aggiunta è la variabile `vb_fly_streaming`, senza effetti senza heartbeat).
+
 Stato: modifiche C++ compilate e provate contro server finti su 127.0.0.1; modifiche PDL **non compilate e non
 provate su un controller** (nessun compilatore PDL fuori dal controller). Prima di usarle sul robot reale
 va fatta la procedura in fondo.
@@ -19,7 +23,7 @@ esegue fino all'ultimo, senza nessuno che lo supervisioni.
 | invio del cancel fallito | n/a | 3 tentativi a 10 ms, poi `RCLCPP_ERROR` con istruzioni; la disattivazione prosegue |
 | socket 1101 che cade mentre il driver fa streaming | `streaming_=false`, il robot finisce la coda | come uno stop: cancel sul canale 1105 (rinviato finché passa), resume solo entro `stop_resume_deviation` (0,01 rad) dal robot, goal del JTC annullato |
 | `motion_server.pdl`: socket 1101 caduto (errore di lettura, comando `D`, riavvio) | `ru_restart_server` richiude e riapre, la coda continua | `ru_restart_server` annulla la coda prima di tutto (stessi flag del comando `X`: `_sb_enable_robot := FALSE`, `_sb_cancel_motion := TRUE`, quindi `cancel_motion` di `arm1_handler` = LOCK, CANCEL ALL, UNLOCK, RESUME, svuota i path); secondo annullamento prima di rimettersi in ascolto |
-| driver zitto con socket aperto (processo congelato, rete in stallo) | nessuna reazione | heartbeat: se durante lo streaming MOVEFLY non arriva nulla per `KI_HEARTBEAT_MS` **e il braccio si sta ancora muovendo** (`$CRNT_DATA[1].MOVE_STATE > 0`) annulla e riavvia il socket; se il braccio è fermo è una pausa normale e continua ad ascoltare |
+| driver zitto con socket aperto (processo congelato, rete in stallo) | nessuna reazione | **solo con `KI_HEARTBEAT_MS` > 0 (default 0, spento)** heartbeat: se durante lo streaming MOVEFLY non arriva nulla per `KI_HEARTBEAT_MS` **e il braccio si sta ancora muovendo** (`$CRNT_DATA[1].MOVE_STATE > 0`) annulla e riavvia il socket; se il braccio è fermo è una pausa normale e continua ad ascoltare |
 
 Il percorso normale dei comandi (un MOVEFLY ogni ciclo a 100 Hz) non è cambiato. In `write()` c'è solo un
 `try_lock` su un mutex (serializza `write()` con l'annullamento di `on_deactivate`; se è occupato salta il
@@ -27,7 +31,7 @@ ciclo, non blocca mai il loop di controllo).
 
 ## Parametri
 
-- `KI_HEARTBEAT_MS` in `comau_ros2_server/motion_server.pdl`: 1000 ms (0 = heartbeat spento). Il driver manda un
+- `KI_HEARTBEAT_MS` in `comau_ros2_server/motion_server.pdl`: **0 = heartbeat spento (default)**; valore da usare una volta provato: 1000 ms. Il driver manda un
   passo ogni 10 ms; il buco più lungo che produce di proposito è 500 ms (`kMaxStepInterval` con `fly_min_step`
   attivo), 200 ms con `stream_decimation` 20. 1000 ms = 2 volte il buco più lungo: tollera i ritardi normali
   dello scheduler. Attenzione: un falso positivo costa almeno ~10 s di pausa, perché il client TCP riprova a
@@ -90,7 +94,10 @@ il TP al 100% (è il moltiplicatore finale). La velocità si abbassa da software
    `ComauHardwareInterface deactivated.`, e il robot frena subito.
 4. Cavo di rete staccato a metà movimento: atteso che il robot finisca la frenata e si fermi; il controller
    si accorge del socket morto solo con il keep-alive TCP (lento): in questo caso conta l'heartbeat (5).
-5. Heartbeat: a metà movimento, al 10%, `kill -STOP <pid del processo ROS>` (il socket resta aperto). Atteso:
+5. Heartbeat (solo dopo le prove 1-4 e il controllo `$DV_TOUT` del punto 1 sotto): porta `KI_HEARTBEAT_MS` a 1000
+   in `motion_server.pdl`, ricarica e ricompila solo quel file, riavvia i programmi PDL. Ripeti la prova 1
+   (nessun `READ_TOUT`, nessun riavvio di `[ROBOT_SERVER]`/`[STATE_SERVER]` con driver attivo, a riposo e in
+   streaming). Se compaiono: rimetti 0. Poi: a metà movimento, al 10%, `kill -STOP <pid del processo ROS>` (il socket resta aperto). Atteso:
    dopo ~1 s, se il braccio si muove ancora, `Heartbeat timeout while moving: no MOVEFLY message for 1000 ms`,
    il robot frena. Poi `kill -KILL <pid>`. Se il braccio ha già finito la coda nel secondo di attesa, non c'è
    timeout (è corretto): ripeti con override più basso (5%) o un movimento più lungo.
@@ -99,24 +106,27 @@ il TP al 100% (è il moltiplicatore finale). La velocità si abbassa da software
 
 ## Punti PDL da verificare sul controller (non compilabili qui)
 
-1. `$DV_TOUT := KI_HEARTBEAT_MS` prima della `READ` e `:= 0` subito dopo: assumo che `$DV_TOUT` sia una variabile
+(Punti 1, 2, 3, 5 e 7 valgono solo con heartbeat acceso; 4 e 6 riguardano anche l'annullamento attivo di default.)
+
+1. `$DV_TOUT := KI_HEARTBEAT_MS` prima della `READ`, con il valore precedente salvato in una variabile locale e
+   ripristinato subito dopo (non forzato a 0; con heartbeat spento `$DV_TOUT` non viene toccato): assumo che `$DV_TOUT` sia una variabile
    *di programma* (ogni server la azzera da solo all'avvio) e che il timeout della `READ` su `NETT:` dia
    l'errore 39992 già gestito dal codice (`ERR_TRAP_ON(39990, 39991, 39992)`). Se invece `$DV_TOUT` fosse globale,
    `robot_server` smetterebbe di restare in attesa dei comandi senza fine (timeout 1 s, riavvii continui):
-   sintomo della verifica 1. Rimedio immediato: `KI_HEARTBEAT_MS = 0`.
+   sintomo della verifica 1. Rimedio: `KI_HEARTBEAT_MS = 0` (default).
 2. `$ERROR` ancora uguale a 39992 dopo `ERR_TRAP_OFF` (il codice esistente fa già affidamento sul valore dopo
    `ERR_TRAP_OFF` in `ru_check_error`).
 3. `$CRNT_DATA[KI_ARM_NUM].MOVE_STATE > 0` come "braccio in moto" (stessa espressione di `robot_server.pdl`, riga 252).
 4. `_sb_cancel_motion` dichiarata `EXPORTED FROM pdl_tcp_functions NOSAVE` in `motion_server` (copiata da
    `arm1_handler`; per il collegamento serve che `pdl_tcp_functions` sia caricato prima, come già per gli altri).
-5. `IF vb_fly_streaming AND (KI_HEARTBEAT_MS > 0) THEN` e `IF vb_fly_streaming AND ($ERROR = 39992) THEN`:
+5. `IF vb_fly_streaming AND (KI_HEARTBEAT_MS > 0) THEN` e `IF t_hb_armed AND ($ERROR = 39992) THEN`:
    booleano AND confronto tra parentesi (come `IF (A) OR (B)` esistenti); un confronto tra costante e costante
    potrebbe dare un avviso del compilatore.
 6. `CANCEL ALL` mentre `arm1_handler` è bloccato dentro un `MOVEFLY ... ADVANCE` in attesa di posto: se
    l'istruzione, sbloccata, accodasse comunque un ultimo moto dopo il cancel, resterebbe un passo (≤ ~75 mm a
    1,25 m/s). Per questo `ru_restart_server` annulla due volte (dopo 400 ms, prima di rimettersi in ascolto) e
    azzera `_sb_enable_robot` prima del cancel. Non verificabile senza il controller.
-7. `WRITE` con la costante `KI_HEARTBEAT_MS` tra gli argomenti.
+7. `WRITE` con la costante `KI_HEARTBEAT_MS` tra gli argomenti; variabili locali `t_hb_armed : BOOLEAN`, `t_dv_tout : INTEGER` nel blocco `VAR` della routine.
 
 ## Altro da sapere
 
