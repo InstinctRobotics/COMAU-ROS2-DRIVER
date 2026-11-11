@@ -60,9 +60,12 @@ namespace comau_hardware_interface
 
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
 
+struct ComauHardwareInterfaceTestPeer;  // unit tests only (test/test_cancel_on_deactivate.cpp)
+
 class HARDWARE_INTERFACE_PUBLIC ComauHardwareInterface : public hardware_interface::SystemInterface
 {
 public:
+  friend struct ComauHardwareInterfaceTestPeer;
   CallbackReturn on_init(const hardware_interface::HardwareInfo & info) override;
   CallbackReturn on_configure(const rclcpp_lifecycle::State & previous_state) override;
   CallbackReturn on_activate(const rclcpp_lifecycle::State & previous_state) override;
