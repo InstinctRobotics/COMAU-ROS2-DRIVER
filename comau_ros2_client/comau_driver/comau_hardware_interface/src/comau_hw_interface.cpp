@@ -554,9 +554,85 @@ CallbackReturn ComauHardwareInterface::on_activate(const rclcpp_lifecycle::State
   return CallbackReturn::SUCCESS;
 }
 
-CallbackReturn ComauHardwareInterface::on_deactivate(const rclcpp_lifecycle::State & /*previous_state*/)
+bool ComauHardwareInterface::cancelQueuedMotion(const char * reason)
+{
+  // Waits for a write() already in flight and keeps the next ones out (they try_lock and skip the cycle)
+  std::lock_guard<std::mutex> lock(write_mutex_);
+
+  if (!(streaming_ || have_last_sent_ || stop_cancel_pending_)) {
+    return true;  // nothing was streamed since the last resume/cancel: nothing can be queued
+  }
+  if (!robot_client_ || !robot_client_->isConnected()) {
+    RCLCPP_ERROR(rclcpp::get_logger("ComauHardwareInterface"),
+                 "%s: the command link (robot port) is down, the motions queued on the controller CANNOT be "
+                 "cancelled from here. The controller cancels them when the motion socket closes.", reason);
+    return false;
+  }
+
+  bool sent = false;
+  constexpr int kAttempts = 3;
+  for (int attempt = 1; attempt <= kAttempts && !sent; ++attempt) {
+    try {
+      sent = robot_client_->sendCancelMessage();
+    } catch (const std::exception & e) {
+      RCLCPP_ERROR(rclcpp::get_logger("ComauHardwareInterface"),
+                   "%s: exception while sending the cancel to the controller (attempt %d/%d): %s",
+                   reason, attempt, kAttempts, e.what());
+    } catch (...) {
+      RCLCPP_ERROR(rclcpp::get_logger("ComauHardwareInterface"),
+                   "%s: unknown exception while sending the cancel to the controller (attempt %d/%d)",
+                   reason, attempt, kAttempts);
+    }
+    if (!sent && attempt < kAttempts) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+
+  if (!sent) {
+    RCLCPP_ERROR(rclcpp::get_logger("ComauHardwareInterface"),
+                 "%s: FAILED to send the cancel to the controller after %d attempts: the motions queued on the "
+                 "controller may keep running until the controller notices the closed motion socket. "
+                 "Stop the robot from the teach pendant if it keeps moving.", reason, kAttempts);
+    return false;
+  }
+
+  have_last_sent_ = false;
+  stop_cancel_pending_ = false;
+  RCLCPP_WARN(rclcpp::get_logger("ComauHardwareInterface"),
+              "%s: motions queued on the controller cancelled before closing the connections", reason);
+  return true;
+}
+
+ComauHardwareInterface::~ComauHardwareInterface()
+{
+  // Last resort (no-op after a normal deactivation): never let an exception escape a destructor
+  try {
+    cancelQueuedMotion("Destruction");
+  } catch (...) {}
+}
+
+CallbackReturn ComauHardwareInterface::on_shutdown(const rclcpp_lifecycle::State & /*previous_state*/)
 {
   is_connected_ = false;
+  cancelQueuedMotion("Shutdown");
+  return CallbackReturn::SUCCESS;
+}
+
+CallbackReturn ComauHardwareInterface::on_error(const rclcpp_lifecycle::State & /*previous_state*/)
+{
+  is_connected_ = false;
+  cancelQueuedMotion("Error");
+  return CallbackReturn::SUCCESS;
+}
+
+CallbackReturn ComauHardwareInterface::on_deactivate(const rclcpp_lifecycle::State & /*previous_state*/)
+{
+  // No new command is dispatched from here on (write() returns at once)...
+  is_connected_ = false;
+  // ...and the steps already queued on the controller are cancelled BEFORE the threads/sockets are closed.
+  // The state flags used by the check (streaming_ ...) must still hold their values: reset them afterwards.
+  // A failure is logged inside; the deactivation proceeds anyway.
+  cancelQueuedMotion("Deactivation");
   robot_ready_ = false;
   streaming_ = false;
   override_sub_.reset();
@@ -708,6 +784,12 @@ return_type ComauHardwareInterface::write(const rclcpp::Time & /*time*/, const r
     return return_type::OK;
   }
 
+  // Never run concurrently with cancelQueuedMotion() (deactivation/shutdown): skip the cycle instead of blocking
+  std::unique_lock<std::mutex> write_lock(write_mutex_, std::try_to_lock);
+  if (!write_lock.owns_lock()) {
+    return return_type::OK;
+  }
+
   static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
 
   // Speed override: sent on the command channel (port 1105) on every (re)connection and on every change
@@ -758,6 +840,15 @@ return_type ComauHardwareInterface::write(const rclcpp::Time & /*time*/, const r
   }
 
   if (!arm1_client_->isConnected()) {
+    if (streaming_) {
+      // The motion socket dropped while streaming: the controller cancels the queued steps when it notices
+      // (motion_server.pdl), so the robot stops short of the commanded trajectory. Treat it as a stop: cancel
+      // from here too if the command link is up (retried in write() until it goes through) and resume only
+      // where the robot stands (stop_resume_deviation), not within the looser max_resume_deviation.
+      RCLCPP_WARN(rclcpp::get_logger("ComauHardwareInterface"),
+                  "Motion link to the controller lost while streaming: treating it as a stop");
+      onRobotStopped();
+    }
     streaming_ = false;
     return return_type::OK;
   }
