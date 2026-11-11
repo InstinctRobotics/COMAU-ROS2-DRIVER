@@ -17,6 +17,7 @@
 #include <vector>
 #include <memory>
 
+#include "comau_hardware_interface/joint_mapping.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_lifecycle/state.hpp"
 
@@ -212,6 +213,8 @@ protected:
 
   /// The size of this vector is (standard_interfaces_.size() x nr_joints)
   std::vector<double> joint_position_command_;
+  /// Controller <-> model joint mapping (built-in, or the `joint_signs` / `joint_offsets_deg` parameters)
+  JointMapping joint_mapping_{JointMapping::racer_default()};
   std::vector<double> joint_velocities_command_;
   std::vector<double> joint_position_;
   std::vector<double> joint_velocities_;

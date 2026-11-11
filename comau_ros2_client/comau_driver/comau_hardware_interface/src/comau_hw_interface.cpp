@@ -18,6 +18,7 @@
 #include <thread>
 #include <vector>
 
+#include "comau_hardware_interface/joint_mapping.hpp"
 #include "comau_tcp_interface/utils/custom_data_type.hpp"
 #include "kdl/tree.hpp"
 #include "kdl_parser/kdl_parser.hpp"
@@ -28,43 +29,6 @@ namespace comau_hardware_interface
 // stsSelector bits published by the controller state server (see state_server.pdl)
 static constexpr uint32_t kStsDriveOn = 0x8;
 static constexpr uint32_t kStsStart = 0x10;
-
-// Comau j6 value (deg) that corresponds to the URDF zero of joint_6. The sign of j6 is inverted
-// (measured on the robot: with +j6 the TP's R followed j1 - j6 instead of staying constant in a Y translation).
-static constexpr float kJ6ZeroDeg = 34.5f;
-
-static double comau_to_ros_joint(size_t index, float deg)
-{
-  switch (index) {
-    case 0: // j1 -> -j1
-      return static_cast<double>(-deg) * M_PI / 180.0;
-    case 2: // j3 -> -90 - j3
-      return static_cast<double>(-90.0f - deg) * M_PI / 180.0;
-    case 3: // j4 -> -j4
-      return static_cast<double>(-deg) * M_PI / 180.0;
-    case 5: // j6 -> -(j6 - 34.5)
-      return static_cast<double>(kJ6ZeroDeg - deg) * M_PI / 180.0;
-    default:
-      return static_cast<double>(deg) * M_PI / 180.0;
-  }
-}
-
-static float ros_to_comau_joint(size_t index, double rad)
-{
-  float deg = static_cast<float>(rad * 180.0 / M_PI);
-  switch (index) {
-    case 0: // j1 -> -j1
-      return -deg;
-    case 2: // j3 -> -90 - j3
-      return -90.0f - deg;
-    case 3: // j4 -> -j4
-      return -deg;
-    case 5: // j6 -> 34.5 - j6
-      return kJ6ZeroDeg - deg;
-    default:
-      return deg;
-  }
-}
 
 CallbackReturn ComauHardwareInterface::on_init(const hardware_interface::HardwareInfo & info)
 {
@@ -168,6 +132,30 @@ CallbackReturn ComauHardwareInterface::on_init(const hardware_interface::Hardwar
   speed_scaling_ = requested_override_.load() / 100.0;
 
   size_t n_joints = info_.joints.size();
+
+  // Controller <-> model joint mapping: built-in (Racer 5-0.80) unless the export overrides it for this robot
+  joint_mapping_ = JointMapping::racer_default();
+  {
+    const auto & params = info_.hardware_parameters;
+    const bool has_signs = params.find("joint_signs") != params.end();
+    const bool has_offsets = params.find("joint_offsets_deg") != params.end();
+    if (has_signs || has_offsets) {
+      try {
+        joint_mapping_.override_with(
+          has_signs ? JointMapping::parse_csv(params.at("joint_signs")) : std::vector<float>{},
+          has_offsets ? JointMapping::parse_csv(params.at("joint_offsets_deg")) : std::vector<float>{},
+          n_joints);
+        RCLCPP_INFO(rclcpp::get_logger("ComauHardwareInterface"),
+                    "Joint mapping overridden by the hardware parameters (joint_signs=%s, joint_offsets_deg=%s)",
+                    has_signs ? params.at("joint_signs").c_str() : "built-in",
+                    has_offsets ? params.at("joint_offsets_deg").c_str() : "built-in");
+      } catch (const std::exception & e) {
+        RCLCPP_ERROR(rclcpp::get_logger("ComauHardwareInterface"), "Invalid joint mapping: %s", e.what());
+        return CallbackReturn::ERROR;
+      }
+    }
+  }
+
   joint_position_.assign(n_joints, 0.0);
   joint_velocities_.assign(n_joints, 0.0);
   joint_position_command_.assign(n_joints, 0.0);
@@ -411,7 +399,7 @@ CallbackReturn ComauHardwareInterface::on_activate(const rclcpp_lifecycle::State
         comau_tcp_interface::utils::vector10f_t joints_float;
         if (msg.getData("joint_position", joints_float)) {
           for (size_t i = 0; i < joint_position_.size() && i < joints_float.size(); ++i) {
-            double rad = comau_to_ros_joint(i, joints_float[i]);
+            double rad = joint_mapping_.to_model(i, joints_float[i]);
             joint_position_[i] = rad;
             joint_position_command_[i] = rad;
           }
@@ -666,7 +654,7 @@ return_type ComauHardwareInterface::read(const rclcpp::Time & /*time*/, const rc
       comau_tcp_interface::utils::vector10f_t joints_float;
       if (msg.getData("joint_position", joints_float)) {
         for (size_t i = 0; i < joint_position_.size() && i < joints_float.size(); ++i) {
-          joint_position_[i] = comau_to_ros_joint(i, joints_float[i]);
+          joint_position_[i] = joint_mapping_.to_model(i, joints_float[i]);
         }
       }
 
@@ -853,7 +841,7 @@ return_type ComauHardwareInterface::write(const rclcpp::Time & /*time*/, const r
   comau_tcp_interface::utils::vector6f_t cmd;
   for (size_t i = 0; i < 6; ++i) {
     if (i < joint_position_command_.size()) {
-      cmd[i] = ros_to_comau_joint(i, joint_position_command_[i]);
+      cmd[i] = joint_mapping_.to_controller(i, joint_position_command_[i]);
     } else {
       cmd[i] = 0.0f;
     }

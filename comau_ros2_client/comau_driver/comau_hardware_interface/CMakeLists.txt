@@ -170,6 +170,15 @@ install(
 # which is appropriate when building the dll but not consuming it.
 target_compile_definitions(${PROJECT_NAME} PRIVATE "comau_hardware_interface_BUILDING_DLL")
 
+# Unit tests (optional: a missing ament_cmake_gtest must not break the driver build)
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest QUIET)
+  if(ament_cmake_gtest_FOUND)
+    ament_add_gtest(test_joint_mapping test/test_joint_mapping.cpp)
+    target_include_directories(test_joint_mapping PRIVATE include)
+  endif()
+endif()
+
 # Export hardware plugins
 pluginlib_export_plugin_description_file(hardware_interface comau_hardware_interface.xml)
 # Export controller plugins
