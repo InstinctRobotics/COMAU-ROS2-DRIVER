@@ -16,6 +16,15 @@ CONST
   KI_COND_UNLOCK  =  3                  -- Condition number for unlocking the arm
   KI_NUM_JNT      =  10
   KI_NUM_CMP      =  6
+  -- Disconnect safety (see docs/disconnect-safety.md)
+  -- Heartbeat: while MOVEFLY steps are being streamed and the arm is still moving, no message for this long [ms]
+  -- means the ROS driver is gone or stalled: the queued motion is cancelled and the socket is restarted.
+  -- The driver streams a step every 10 ms (100 Hz); the longest gap it produces on purpose is 500 ms
+  -- (kMaxStepInterval with fly_min_step on), 200 ms with stream_decimation 20. 1000 ms = 2x the longest gap.
+  -- (0 = heartbeat off). DEFAULT OFF: with 0 the code never touches $DV_TOUT. Set it to 1000 only after the
+  -- test on the real controller described in docs/disconnect-safety.md (scope of $DV_TOUT, error code of the
+  -- read timeout). 1000 ms = 2x the longest gap the driver produces on purpose.
+  KI_HEARTBEAT_MS = 0
   -- Error values
   KI_ERR_NULL               = 0x00000 -- Null error
   KI_ERR_STATE_ACCEPT       = 0x00001 -- State  Server  error 15470 : Address already in use
@@ -92,6 +101,7 @@ VAR
   _sb_shutdown         : BOOLEAN   EXPORTED FROM pdl_tcp_functions NOSAVE -- shared variable for stopping the program
   _sb_enable_robot     : BOOLEAN   EXPORTED FROM pdl_tcp_functions NOSAVE -- Shared variable to show that the robot is allowed to move 
   _sb_reset_motion     : BOOLEAN   EXPORTED FROM pdl_tcp_functions NOSAVE -- Shared flag to cancel the motion and then reset
+  _sb_cancel_motion    : BOOLEAN   EXPORTED FROM pdl_tcp_functions NOSAVE -- Shared flag to cancel the motion (arm1_handler: cancel_motion)
   _sb_lock_robot       : BOOLEAN   EXPORTED FROM pdl_tcp_functions NOSAVE -- Shared flag to lock the arm
   _sb_unlock_robot     : BOOLEAN   EXPORTED FROM pdl_tcp_functions NOSAVE -- Shared flag to unlock the arm
   _si_verbose          : INTEGER   EXPORTED FROM pdl_tcp_functions NOSAVE -- Level of logging
@@ -124,6 +134,8 @@ VAR
   vr_fly_dist             : REAL                 EXPORTED FROM motion_server NOSAVE -- Movefly fly distance, shared with arm1_handler
   -- tcp/ip msg id
   t_msg_id                : INTEGER                (0)NOSAVE
+  -- Disconnect safety: TRUE from the first 'F' (MOVEFLY) message until the motion is cancelled or the stream ends
+  vb_fly_streaming        : BOOLEAN            (FALSE)NOSAVE
   -- Check move workspace
   vs_errcode              : STRING[50]                NOSAVE
   vb_workspace_in         : BOOLEAN                   EXPORTED FROM motion_server NOSAVE -- Workspace check for all moves
@@ -305,6 +317,22 @@ BEGIN
   
 END ru_check_error
 
+  --------------------------------------------------------------------
+  --- Routine: ru_cancel_queued_motion
+  --- Brief: Disconnect safety. The MOVEFLY steps already queued on the controller (ADVANCE) keep running when
+  ---        the ROS side goes away, with nobody supervising them. Same effect as the 'X' (cancel) command of
+  ---        robot_server: arm1_handler runs cancel_motion (LOCK, CANCEL ALL, UNLOCK, RESUME, clears the paths).
+  ---        _sb_enable_robot goes FALSE first, so that arm1_handler does not issue one more MOVEFLY with the
+  ---        last goal after the cancel.
+  --------------------------------------------------------------------
+ROUTINE ru_cancel_queued_motion
+BEGIN
+  vb_fly_streaming  := FALSE
+  _sb_enable_robot  := FALSE
+  _sb_cancel_motion := TRUE
+  WRITE _vs_screen_lun (KS_MAIN_LOG, 'Cancelling the motion queued on the controller (ROS side lost)', NL)
+END ru_cancel_queued_motion
+
   ------------------------------------------------------------------
   --- Routine: receive_motion_message
   --- Brief: Receiving the motion command and send it for execution 
@@ -316,11 +344,39 @@ VAR
   t_joint_pos   : JOINTPOS FOR ARM[1]
   t_position    : POSITION 
   vs_err_string : STRING[50]
+  t_hb_armed    : BOOLEAN
+  t_dv_tout     : INTEGER
 BEGIN
   $ERROR := 0
+  t_hb_armed := FALSE
+  -- Heartbeat: only while MOVEFLY steps are being streamed the wait for the next message has a timeout
+  -- (a read timeout is trapped below as error 39992). Otherwise it waits forever, as before.
+  -- KI_HEARTBEAT_MS = 0 switches the heartbeat off.
+  -- $DV_TOUT is touched only when the heartbeat is on: its previous value is saved and restored.
+  IF vb_fly_streaming AND (KI_HEARTBEAT_MS > 0) THEN
+    t_hb_armed := TRUE
+    t_dv_tout  := $DV_TOUT
+    $DV_TOUT   := KI_HEARTBEAT_MS
+  ENDIF
   ERR_TRAP_ON(39990, 39991, 39992)
   READ vi_server_netlun (t_msg.id::4, t_msg.vs_motion_type::1)
   ERR_TRAP_OFF(39990, 39991, 39992)
+  IF t_hb_armed THEN
+    $DV_TOUT := t_dv_tout   -- restore the previous value (not forced to 0)
+  ENDIF
+  IF t_hb_armed AND ($ERROR = 39992) THEN
+    -- Nothing received for KI_HEARTBEAT_MS during the stream
+    vb_fly_streaming := FALSE
+    IF ($CRNT_DATA[KI_ARM_NUM].MOVE_STATE > 0) THEN
+      -- The arm is still moving on queued steps and the ROS side is silent: cancel and restart the socket
+      -- (ru_restart_server cancels the queue; the driver reconnects and resumes only close to the robot)
+      WRITE _vs_screen_lun (KS_MAIN_LOG, 'Heartbeat timeout while moving: no MOVEFLY message for ', KI_HEARTBEAT_MS, ' ms', NL)
+      RETURN(FALSE)
+    ENDIF
+    -- Arm already at rest: a normal pause between trajectories, keep listening
+    $ERROR := 0
+    RETURN(TRUE)
+  ENDIF
   IF (ru_check_error = 1) THEN -- Return and try restarting in error case
     RETURN(FALSE)
   ELSE
@@ -331,6 +387,9 @@ BEGIN
 
   t_msg_id       := t_msg.id
   vs_motion_type := t_msg.vs_motion_type
+  IF vs_motion_type <> 'F' THEN
+    vb_fly_streaming := FALSE   -- not a MOVEFLY stream (heartbeat only watches the MOVEFLY stream)
+  ENDIF
   WRITE _vs_screen_lun (KS_MAIN_LOG, 'vs_motion_type: ', vs_motion_type, NL)
   SELECT vs_motion_type OF  
     CASE ('S'): -- Sensor Tracking motion case
@@ -416,6 +475,7 @@ BEGIN
       IF (ru_check_error = 1) THEN -- Return and try restarting in error case
         RETURN(FALSE)
       ENDIF
+      vb_fly_streaming := TRUE   -- from now on the heartbeat watches the stream
 
       JNT(vj_joint_pos, t_msg.joint_position_command[1], t_msg.joint_position_command[2], t_msg.joint_position_command[3], t_msg.joint_position_command[4], t_msg.joint_position_command[5], t_msg.joint_position_command[6])
       POS_IN_RANGE(vj_joint_pos,vb_workspace_in)
@@ -454,9 +514,15 @@ END receive_motion_message
 ROUTINE ru_restart_server
 BEGIN
   WRITE _vs_screen_lun (KS_MAIN_LOG, 'Restarting Arm Server ... ', NL)
+  -- SAFETY: the socket is gone (driver closed it, 'D' command, read error, heartbeat timeout): cancel the motion
+  -- queued on the controller BEFORE anything else, so that the robot does not keep moving unsupervised
+  ru_cancel_queued_motion
   DELAY 200
   tcp_server_disconnect(vi_server_netlun, _vs_screen_lun, _si_verbose, KS_MAIN_LOG, KI_ID_HANDLER)
   DELAY 200
+  -- Second cancel, still before listening again (so no new stream can be cancelled by mistake): covers a
+  -- MOVEFLY that arm1_handler was already issuing when the first one ran
+  ru_cancel_queued_motion
   vi_server_netlun := tcp_server_accept(vi_server_netlun, KI_LOCAL_PORT, _vs_screen_lun, _si_verbose, KS_MAIN_LOG, KI_ID_HANDLER)
   ENABLE CONDITION[KI_COND_RESTART]
 END ru_restart_server

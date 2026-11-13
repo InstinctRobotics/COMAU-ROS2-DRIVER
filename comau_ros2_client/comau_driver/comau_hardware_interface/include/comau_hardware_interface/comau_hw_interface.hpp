@@ -29,6 +29,7 @@
 
 #include <array>
 #include <atomic>
+#include <mutex>
 #include <set>
 
 #include "kdl/chain.hpp"
@@ -59,13 +60,21 @@ namespace comau_hardware_interface
 
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
 
+struct ComauHardwareInterfaceTestPeer;  // unit tests only (test/test_cancel_on_deactivate.cpp)
+
 class HARDWARE_INTERFACE_PUBLIC ComauHardwareInterface : public hardware_interface::SystemInterface
 {
 public:
+  friend struct ComauHardwareInterfaceTestPeer;
   CallbackReturn on_init(const hardware_interface::HardwareInfo & info) override;
   CallbackReturn on_configure(const rclcpp_lifecycle::State & previous_state) override;
   CallbackReturn on_activate(const rclcpp_lifecycle::State & previous_state) override;
   CallbackReturn on_deactivate(const rclcpp_lifecycle::State & previous_state) override;
+  // Shutdown / error from the ACTIVE state do not necessarily go through on_deactivate: the queued motion
+  // must be cancelled there too (see cancelQueuedMotion)
+  CallbackReturn on_shutdown(const rclcpp_lifecycle::State & previous_state) override;
+  CallbackReturn on_error(const rclcpp_lifecycle::State & previous_state) override;
+  ~ComauHardwareInterface() override;
 
   std::vector<hardware_interface::StateInterface> export_state_interfaces() override;
   std::vector<hardware_interface::CommandInterface> export_command_interfaces() override;
@@ -176,6 +185,18 @@ protected:
   /// Hardware parameters: stop_cancel_controller (bool), stop_cancel_action (action name, "" = off),
   /// stop_resume_deviation (rad).
   void onRobotStopped();
+
+  /// Disconnect safety: the MOVEFLY steps already queued on the controller keep running when the ROS side goes
+  /// away (deactivation, shutdown, error). Sends the CANCEL (robot command 'X', CANCEL ALL on the arm) on the
+  /// command link BEFORE the sockets are closed, if something may be queued (streaming active, a step sent since
+  /// the last resume, or a stop cancel still pending). Idempotent: once the cancel went through, further calls do
+  /// nothing until new steps are streamed. A failure is logged as an error and never blocks the caller (the
+  /// controller-side PDL cancels the queue by itself when the motion socket closes). Returns true if nothing had to
+  /// be sent or the cancel was sent. Takes write_mutex_.
+  bool cancelQueuedMotion(const char * reason);
+  /// Serialises write() with cancelQueuedMotion(): the cancel is never interleaved with a MOVEFLY being sent, and
+  /// no new MOVEFLY is sent once the cancel has been taken (write() uses try_lock: it never blocks the control loop)
+  std::mutex write_mutex_;
   bool stop_cancel_controller_{true};
   std::string stop_cancel_action_{"/joint_trajectory_controller/follow_joint_trajectory"};
   double stop_resume_deviation_{0.01};
